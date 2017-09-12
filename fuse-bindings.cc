@@ -67,7 +67,8 @@ enum bindings_ops_t {
   OP_SYMLINK,
   OP_MKDIR,
   OP_RMDIR,
-  OP_DESTROY
+  OP_DESTROY,
+  OP_SETATTR_X
 };
 
 static Nan::Persistent<Function> buffer_constructor;
@@ -127,6 +128,7 @@ struct bindings_t {
   Nan::Callback *ops_mkdir;
   Nan::Callback *ops_rmdir;
   Nan::Callback *ops_destroy;
+  Nan::Callback *ops_setattr_x;
 
   Nan::Callback *callback;
 
@@ -605,6 +607,18 @@ static void bindings_destroy (void *data) {
   bindings_call(b);
 }
 
+#ifdef __APPLE__
+static int setattr_x(const char *path, struct setattr_x *attr) {
+  bindings_t *b = bindings_get_context();
+
+  b->op = OP_SETATTR_X;
+  b->path = (char *) path;
+  b->data = (void *) attr;
+
+  return bindings_call(b);
+}
+#endif
+
 static void bindings_free (bindings_t *b) {
   if (b->ops_access != NULL) delete b->ops_access;
   if (b->ops_truncate != NULL) delete b->ops_truncate;
@@ -640,6 +654,7 @@ static void bindings_free (bindings_t *b) {
   if (b->ops_rmdir != NULL) delete b->ops_rmdir;
   if (b->ops_init != NULL) delete b->ops_init;
   if (b->ops_destroy != NULL) delete b->ops_destroy;
+  if (b->ops_setattr_x != NULL) delete b->ops_setattr_x;
   if (b->callback != NULL) delete b->callback;
 
   bindings_mounted[b->index] = NULL;
@@ -695,6 +710,9 @@ static thread_fn_rtn_t bindings_thread (void *data) {
   if (b->ops_rmdir != NULL) ops.rmdir = bindings_rmdir;
   if (b->ops_init != NULL) ops.init = bindings_init;
   if (b->ops_destroy != NULL) ops.destroy = bindings_destroy;
+#ifdef __APPLE__
+  if (b->ops_setattr_x != NULL) ops.setattr_x = setattr_x;
+#endif
 
   int argc = !strcmp(b->mntopts, "-o") ? 1 : 2;
   char *argv[] = {
@@ -781,6 +799,42 @@ NAN_INLINE static void bindings_set_statfs (struct statvfs *statfs, Local<Object
   if (obj->Has(LOCAL_STRING("flag"))) statfs->f_flag = obj->Get(LOCAL_STRING("flag"))->Uint32Value();
   if (obj->Has(LOCAL_STRING("namemax"))) statfs->f_namemax = obj->Get(LOCAL_STRING("namemax"))->Uint32Value();
 }
+
+#ifdef __APPLE__
+NAN_INLINE static void bindings_get_setattr_x (struct setattr_x* attr, Local<Object> obj) {
+  if (SETATTR_WANTS_MODE(attr)) {
+    obj->Set(LOCAL_STRING("mode"), Nan::New<Number>(attr->mode));
+  }
+  if (SETATTR_WANTS_UID(attr)) {
+    obj->Set(LOCAL_STRING("uid"), Nan::New<Number>(attr->uid));
+  }
+  if (SETATTR_WANTS_GID(attr)) {
+    obj->Set(LOCAL_STRING("gid"), Nan::New<Number>(attr->gid));
+  }
+  if (SETATTR_WANTS_SIZE(attr)) {
+    obj->Set(LOCAL_STRING("size"), Nan::New<Number>(attr->size));
+  }
+  if (SETATTR_WANTS_MODTIME(attr)) {
+    Local<Date> modtime = bindings_get_date(&attr->modtime);
+    obj->Set(LOCAL_STRING("modtime"), modtime);
+    if (!SETATTR_WANTS_ACCTIME(attr)) {
+      obj->Set(LOCAL_STRING("acctime"), modtime);
+    }
+  }
+  if (SETATTR_WANTS_CRTIME(attr)) {
+    obj->Set(LOCAL_STRING("crtime"), bindings_get_date(&attr->crtime));
+  }
+  if (SETATTR_WANTS_CHGTIME(attr)) {
+    obj->Set(LOCAL_STRING("chgtime"), bindings_get_date(&attr->chgtime));
+  }
+  if (SETATTR_WANTS_BKUPTIME(attr)) {
+    obj->Set(LOCAL_STRING("bkuptime"), bindings_get_date(&attr->bkuptime));
+  }
+  if (SETATTR_WANTS_FLAGS(attr)) {
+    obj->Set(LOCAL_STRING("flags"), Nan::New<Number>(attr->flags));
+  }
+}
+#endif
 
 class SetDirWorker : public Nan::AsyncWorker {
  public:
@@ -891,6 +945,7 @@ NAN_METHOD(OpCallback) {
       case OP_MKDIR:
       case OP_RMDIR:
       case OP_DESTROY:
+      case OP_SETATTR_X:
       break;
     }
   }
@@ -1170,6 +1225,18 @@ static void bindings_dispatch (uv_async_t* handle, int status) {
       bindings_call_op(b, b->ops_fsyncdir, 4, tmp);
     }
     return;
+
+    case OP_SETATTR_X: {
+#ifdef __APPLE__
+      struct setattr_x *attr = (struct setattr_x *) b->data;
+
+      Local<Object> obj = Nan::New<Object>();
+      bindings_get_setattr_x(attr, obj);
+      Local<Value> tmp[] = {LOCAL_STRING(b->path), obj, callback};
+      bindings_call_op(b, b->ops_setattr_x, 3, tmp);
+#endif
+    }
+    return;
   }
 
   semaphore_signal(&(b->semaphore));
@@ -1249,6 +1316,9 @@ NAN_METHOD(Mount) {
   b->ops_mkdir = LOOKUP_CALLBACK(ops, "mkdir");
   b->ops_rmdir = LOOKUP_CALLBACK(ops, "rmdir");
   b->ops_destroy = LOOKUP_CALLBACK(ops, "destroy");
+#ifdef __APPLE__
+  b->ops_setattr_x = LOOKUP_CALLBACK(ops, "setattr_x");
+#endif
 
   Local<Value> tmp[] = {Nan::New<Number>(index), Nan::New<FunctionTemplate>(OpCallback)->GetFunction()};
   b->callback = new Nan::Callback(callback_constructor->Call(2, tmp).As<Function>());
